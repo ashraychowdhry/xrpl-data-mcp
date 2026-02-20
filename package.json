@@ -7,6 +7,8 @@
   "main": "src/server.js",
   "scripts": {
     "start": "node src/server.js",
+    "start:http": "node src/server.js",
+    "start:stdio": "MCP_TRANSPORT=stdio node src/server.js",
     "dev": "node --watch src/server.js"
   },
   "dependencies": {

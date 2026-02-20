@@ -1,11 +1,18 @@
+import { createServer } from "node:http";
+import { randomUUID } from "node:crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 
 const LOS_BASE_URL = process.env.LOS_BASE_URL ?? "https://los.prod.ripplex.io";
 const DATA_XRPL_BASE_URL = process.env.DATA_XRPL_BASE_URL ?? "https://data.xrpl.org";
 const XRPL_RPC_URL = process.env.XRPL_RPC_URL ?? "https://s1.ripple.com:51234";
-const XRPLMETA_BASE_URL = process.env.XRPLMETA_BASE_URL ?? "https://api.xrplmeta.org";
+const XRPLMETA_BASE_URL = process.env.XRPLMETA_BASE_URL ?? "https://s1.xrplmeta.org";
+const MCP_TRANSPORT = String(process.env.MCP_TRANSPORT ?? "http").toLowerCase();
+const MCP_HTTP_HOST = process.env.MCP_HTTP_HOST ?? process.env.HOST ?? "0.0.0.0";
+const MCP_HTTP_PORT = Number.parseInt(process.env.MCP_HTTP_PORT ?? process.env.PORT ?? "3000", 10);
+const MCP_HTTP_PATH = process.env.MCP_HTTP_PATH ?? "/mcp";
 
 const server = new McpServer({
   name: "xrpl-data-mcp",
@@ -1584,9 +1591,91 @@ server.tool(
   }
 );
 
-async function main() {
+async function startStdio() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
+}
+
+function getPathname(url, fallback = "/") {
+  try {
+    return new URL(url, "http://localhost").pathname;
+  } catch {
+    return fallback;
+  }
+}
+
+function writeJson(res, statusCode, payload) {
+  res.statusCode = statusCode;
+  res.setHeader("Content-Type", "application/json");
+  res.end(JSON.stringify(payload));
+}
+
+async function startHttp() {
+  if (!Number.isFinite(MCP_HTTP_PORT) || MCP_HTTP_PORT < 1 || MCP_HTTP_PORT > 65535) {
+    throw new Error(`Invalid MCP_HTTP_PORT/PORT value: ${String(process.env.MCP_HTTP_PORT ?? process.env.PORT)}`);
+  }
+
+  const transport = new StreamableHTTPServerTransport({
+    sessionIdGenerator: () => randomUUID()
+  });
+  await server.connect(transport);
+
+  const httpServer = createServer(async (req, res) => {
+    try {
+      const pathname = getPathname(req.url || "/");
+
+      if (pathname === "/health") {
+        return writeJson(res, 200, {
+          ok: true,
+          name: "xrpl-data-mcp",
+          transport: "streamable-http",
+          endpoint: MCP_HTTP_PATH
+        });
+      }
+
+      if (pathname !== MCP_HTTP_PATH) {
+        return writeJson(res, 404, {
+          error: "Not Found",
+          message: `Use ${MCP_HTTP_PATH} for MCP requests.`
+        });
+      }
+
+      await transport.handleRequest(req, res);
+    } catch (error) {
+      if (!res.headersSent) {
+        writeJson(res, 500, {
+          error: "Internal Server Error",
+          message: error instanceof Error ? error.message : String(error)
+        });
+      }
+    }
+  });
+
+  await new Promise((resolve, reject) => {
+    httpServer.once("error", reject);
+    httpServer.listen(MCP_HTTP_PORT, MCP_HTTP_HOST, resolve);
+  });
+
+  console.error(`MCP HTTP server listening on http://${MCP_HTTP_HOST}:${MCP_HTTP_PORT}${MCP_HTTP_PATH}`);
+
+  const shutdown = async () => {
+    try {
+      await transport.close();
+    } finally {
+      httpServer.close(() => process.exit(0));
+    }
+  };
+
+  process.once("SIGINT", shutdown);
+  process.once("SIGTERM", shutdown);
+}
+
+async function main() {
+  if (MCP_TRANSPORT === "stdio") {
+    await startStdio();
+    return;
+  }
+  await startHttp();
 }
 
 main().catch((error) => {
